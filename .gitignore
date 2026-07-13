@@ -220,3 +220,4 @@ __marimo__/
 # CSV's:
 application_train.csv
 application_test.csv
+.csv
