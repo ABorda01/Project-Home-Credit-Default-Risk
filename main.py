@@ -7,7 +7,7 @@ This script takes best models and strategies from EDA.ipynb and (mainly) model_s
 and condenses it into a cleaner .py script which produces the most relevant plots.
 
 The justifications for the exploratory data analysis can be found in EDA.ipynb and the ones for the 
-feature-engineering/model election related decisions can be found in model_selection_improv.ipynb.
+feature-engineering related decisions can be found in model_selection_improv.ipynb.
 """
 
 # Imports: (save sklearn methods)
@@ -26,6 +26,7 @@ from contextlib import contextmanager
 #--------------------------------------------------------------------------------------------
 PROGRESS_LOG = True          # set False to silence all progress output
 HEARTBEAT_INTERVAL_SEC = 60  # how often the heartbeat pings during long silent calls
+CUSTOM_SCALE_POS_WEIGHT = 5.0  # user-adjustable scale_pos_weight, third KDE subplot below
 
 _SCRIPT_START = time.time()
 
@@ -289,13 +290,13 @@ _log(f'Naive models done - RF AUC={naive_forest_auc:.4f}, LogReg AUC={naive_logi
 
 from sklearn.model_selection import GridSearchCV
 
-log_reg = LogisticRegression(max_iter=1000) 
+log_reg = LogisticRegression(max_iter=2000)
 
 param_grid = [
     {
         'solver': ['saga'],
         'C': [0.001, 0.01, 0.1, 1, 10, 100, 1000],
-        'l1_ratio': [0.0, 0.25, 0.5, 1.0] 
+        'l1_ratio': [0.0, 0.25, 0.5, 1.0]
     }
 ]
 
@@ -367,9 +368,6 @@ boost_auc = roc_auc_score(y_test, boost_preds)
 _log(f'Boosted model done - AUC={boost_auc:.4f}')
 
 
-import shap
-
-
 explainer = shap.TreeExplainer(boost_fin)
 
 with _heartbeat('SHAP value computation'):
@@ -382,7 +380,201 @@ print(f'Naive Logistic regressiom: {naive_logistic_auc}')
 print(f'WoE transformed logistic regression: {woe_logistic_auc}')
 print(f'Boosted Tree-based classifier: {boost_auc}')
 
+#--------------------------------------------------------------------------------------------
+# Plot 1: ROC curves across all four models, grouped for comparison
+#--------------------------------------------------------------------------------------------
+
+fpr_nl, tpr_nl, _ = roc_curve(y_test_base, naive_logistic_probas)
+fpr_rf, tpr_rf, _ = roc_curve(y_test_base, naive_forest_probas)
+fpr_wl, tpr_wl, _ = roc_curve(y_test, woe_logistic_probas)
+fpr_xgb, tpr_xgb, _ = roc_curve(y_test, boost_preds)
+
+fig1, axes1 = plt.subplots(1, 3, figsize=(18, 5))
+
+axes1[0].plot(fpr_nl, tpr_nl, label=f'Naive Logistic (AUC={naive_logistic_auc:.3f})')
+axes1[0].plot(fpr_wl, tpr_wl, label=f'WoE Logistic (AUC={woe_logistic_auc:.3f})')
+axes1[0].set_title('Logistic regressors')
+
+axes1[1].plot(fpr_rf, tpr_rf, label=f'Naive Random Forest (AUC={naive_forest_auc:.3f})')
+axes1[1].plot(fpr_xgb, tpr_xgb, label=f'Boosted XGBoost (AUC={boost_auc:.3f})')
+axes1[1].set_title('Tree-based classifiers')
+
+axes1[2].plot(fpr_xgb, tpr_xgb, label=f'Boosted XGBoost (AUC={boost_auc:.3f})')
+axes1[2].plot(fpr_wl, tpr_wl, label=f'WoE Logistic (AUC={woe_logistic_auc:.3f})')
+axes1[2].set_title('Best of each family')
+
+for ax in axes1:
+    ax.plot([0, 1], [0, 1], linestyle=':', color='gray', label='No-skill baseline')
+    ax.set_xlabel('False Positive Rate')
+    ax.set_ylabel('True Positive Rate')
+    ax.legend(fontsize=9)
+    ax.grid(True, linestyle='--', alpha=0.4)
+
+fig1.suptitle('ROC curves')
+fig1.tight_layout()
+plt.show()
 
 #--------------------------------------------------------------------------------------------
-# Figures
+# Plot 2: Boosted tree - predicted P(default) by true class, three re-weighting variants
 #--------------------------------------------------------------------------------------------
+
+# XGBClassifier has no class_weight param -- scale_pos_weight is the direct analog,
+# reweighting the positive class's gradient contribution during training the same way
+# class_weight='balanced' reweights the loss for sklearn estimators. The commonly
+# recommended "balanced" value is sum(negative) / sum(positive) in the training data.
+balanced_scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+
+_boost_variant_kwargs = dict(
+    n_estimators=optimal_trees,   # reuse the tree count found via early stopping above
+    learning_rate=0.03,
+    max_depth=5,
+    min_child_weight=5,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.1,
+    reg_lambda=1.0,
+    objective='binary:logistic',
+    tree_method='hist',
+    random_state=42,
+)
+
+def _fit_boost_variant(scale_pos_weight, label):
+    """Refit the boosted tree with a given scale_pos_weight and return test-set P(default)."""
+    _log(f'Fitting boosted tree variant: {label} (scale_pos_weight={scale_pos_weight:.3f})...')
+    model = XGBClassifier(scale_pos_weight=scale_pos_weight, **_boost_variant_kwargs)
+    with _heartbeat(f'xgboost variant fit - {label}'):
+        model.fit(train_ts, y_train)
+    return model.predict_proba(test_ts)[:, 1]
+
+boost_preds_standard = boost_preds  # already fit above, scale_pos_weight=1 (default)
+boost_preds_balanced = _fit_boost_variant(balanced_scale_pos_weight, 'balanced')
+boost_preds_custom = _fit_boost_variant(CUSTOM_SCALE_POS_WEIGHT, 'user-custom')
+
+_log('Boosted tree re-weighting variants done')
+
+def _kde_variant_subplot(ax, probas, title):
+    pred_df = pd.DataFrame({'P(default)': probas,
+                             'TARGET': y_test.map({0: 'No default', 1: 'Default'}).values},
+                            index=y_test.index)
+    sns.kdeplot(data=pred_df, x='P(default)', hue='TARGET',
+                common_norm=False, fill=True, alpha=0.3, ax=ax)
+    ax.axvline(0.5, color='black', linestyle=':', linewidth=1.2, label='0.5 cutoff')
+    ax.set_xlabel('Predicted P(default)')
+    ax.set_title(title)
+    ax.legend(fontsize=9)
+    ax.grid(True, linestyle='--', alpha=0.4)
+
+fig2, axes2 = plt.subplots(1, 3, figsize=(18, 5))
+_kde_variant_subplot(axes2[0], boost_preds_standard, 'Standard (scale_pos_weight=1)')
+_kde_variant_subplot(axes2[1], boost_preds_balanced, f'Balanced (scale_pos_weight={balanced_scale_pos_weight:.2f})')
+_kde_variant_subplot(axes2[2], boost_preds_custom, f'User-custom (scale_pos_weight={CUSTOM_SCALE_POS_WEIGHT:.2f})')
+
+fig2.suptitle('Boosted tree: predicted default probability by true class, across re-weighting schemes')
+fig2.tight_layout()
+plt.show()
+
+#--------------------------------------------------------------------------------------------
+# SHAP Plots: Waterfall examples and Beeswarm plots
+#--------------------------------------------------------------------------------------------
+
+shap.plots.beeswarm(shap_values_sample)  # reuse the sample already computed above -- avoids recomputing SHAP values twice
+
+
+preds = boost_fin.predict(test_ts)
+y_test_arr = np.asarray(y_test)
+
+correct_default = np.where((preds == 1) & (y_test_arr == 1))[0]
+correct_nondefault = np.where((preds == 0) & (y_test_arr == 0))[0]
+
+# pick one example row of each (use .iloc since these are positional indices)
+idx_default = correct_default[0]
+idx_nondefault = correct_nondefault[0]
+
+background = train_ts.sample(200, random_state=10)  # background for marginalizing
+
+explainer_proba = shap.TreeExplainer(
+    boost_fin,
+    data=background,
+    feature_perturbation="interventional",
+    model_output="probability",
+)
+
+shap_values_proba = explainer_proba(test_ts.iloc[[idx_default]])
+shap.plots.waterfall(shap_values_proba[0], max_display=15)
+shap_values_proba = explainer_proba(test_ts.iloc[[idx_nondefault]])
+shap.plots.waterfall(shap_values_proba[0], max_display=15)
+
+#--------------------------------------------------------------------------------------------
+# Plot 4: KS statistic and cumulative gains chart (boosted model, test set)
+#--------------------------------------------------------------------------------------------
+
+ks_df = pd.DataFrame({'y': y_test_arr, 'proba': boost_preds}).sort_values('proba', ascending=False).reset_index(drop=True)
+ks_df['cum_pop_pct'] = (ks_df.index + 1) / len(ks_df)
+ks_df['cum_default_pct'] = ks_df['y'].cumsum() / ks_df['y'].sum()
+ks_df['cum_nondefault_pct'] = (1 - ks_df['y']).cumsum() / (1 - ks_df['y']).sum()
+ks_df['ks_gap'] = ks_df['cum_default_pct'] - ks_df['cum_nondefault_pct']
+
+ks_idx = ks_df['ks_gap'].idxmax()
+ks_stat = ks_df.loc[ks_idx, 'ks_gap']
+ks_at = ks_df.loc[ks_idx, 'cum_pop_pct']
+
+fig4, axes4 = plt.subplots(1, 2, figsize=(14, 5))
+
+axes4[0].plot(ks_df['cum_pop_pct'], ks_df['cum_default_pct'], label='Cumulative % defaults')
+axes4[0].plot(ks_df['cum_pop_pct'], ks_df['cum_nondefault_pct'], label='Cumulative % non-defaults')
+axes4[0].vlines(ks_at, ks_df.loc[ks_idx, 'cum_nondefault_pct'], ks_df.loc[ks_idx, 'cum_default_pct'],
+                 color='black', linestyle='--', label=f'KS={ks_stat:.3f} @ top {ks_at:.0%}')
+axes4[0].set_xlabel('Cumulative % of population (sorted by predicted risk, desc.)')
+axes4[0].set_ylabel('Cumulative % of class')
+axes4[0].set_title('KS statistic')
+axes4[0].legend(fontsize=9)
+axes4[0].grid(True, linestyle='--', alpha=0.4)
+
+axes4[1].plot(ks_df['cum_pop_pct'], ks_df['cum_default_pct'], label='Boosted model')
+axes4[1].plot([0, 1], [0, 1], linestyle=':', color='gray', label='Random baseline')
+axes4[1].set_xlabel('Cumulative % of population targeted')
+axes4[1].set_ylabel('Cumulative % of defaults captured')
+axes4[1].set_title('Cumulative gains chart')
+axes4[1].legend(fontsize=9)
+axes4[1].grid(True, linestyle='--', alpha=0.4)
+
+fig4.suptitle('Boosted tree: KS statistic and cumulative gains (test set)')
+fig4.tight_layout()
+plt.show()
+
+_log(f'KS statistic = {ks_stat:.4f} at top {ks_at:.1%} of population')
+
+#--------------------------------------------------------------------------------------------
+# Plot 5: Information Value (IV) by feature, from the WoE binning process
+#--------------------------------------------------------------------------------------------
+
+iv_summary = binning_process.summary().sort_values('iv', ascending=False)
+iv_top = iv_summary.head(20).iloc[::-1]  # reverse so highest IV plots at the top
+
+fig5, ax5 = plt.subplots(figsize=(9, 8))
+ax5.barh(iv_top['name'], iv_top['iv'], color='steelblue')
+ax5.set_xlabel('Information Value (IV)')
+ax5.set_title('Top 20 features by Information Value (optbinning)')
+ax5.grid(True, linestyle='--', alpha=0.4, axis='x')
+fig5.tight_layout()
+plt.show()
+
+#--------------------------------------------------------------------------------------------
+# Plot 6: XGBoost training curve (early-stopping fit, validation AUC per boosting round)
+#--------------------------------------------------------------------------------------------
+
+evals_result = model_fixed.evals_result()
+val_auc = evals_result['validation_0']['auc']
+
+fig6, ax6 = plt.subplots(figsize=(9, 5))
+ax6.plot(range(1, len(val_auc) + 1), val_auc, label='Validation AUC')
+ax6.axvline(optimal_trees, color='black', linestyle='--', label=f'Early stop @ {optimal_trees} trees')
+ax6.set_xlabel('Boosting round')
+ax6.set_ylabel('AUC')
+ax6.set_title('XGBoost training curve (early-stopping fit)')
+ax6.legend(fontsize=9)
+ax6.grid(True, linestyle='--', alpha=0.4)
+fig6.tight_layout()
+plt.show()
+
+_log('KS/gains, IV, and training curve plots complete')
